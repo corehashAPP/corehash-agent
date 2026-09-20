@@ -3,7 +3,7 @@
  * Plugin Name: Corehash Agent
  * Plugin URI:  https://corehash.app
  * Description: Connects this site to Corehash. Exposes one secured REST endpoint with an inventory of versions, plugins and file hashes.
- * Version:     0.2.0
+ * Version:     0.3.0
  * Author:      Corehash
  * Author URI:  https://corehash.app
  * License:     GPL-2.0-or-later
@@ -14,11 +14,12 @@ if (!defined('ABSPATH')) exit;
 
 final class Corehash_Agent
 {
-    const VERSION      = '0.2.0';
+    const VERSION      = '0.3.0';
     const OPTION_TOKEN = 'corehash_token';
     const TRANSIENT    = 'corehash_inventory';
     const CACHE_TTL    = 50 * MINUTE_IN_SECONDS;
     const NAMESPACE    = 'corehash/v1';
+    const UPDATE_URL   = 'https://corehash.app/agent/update.json';
 
     public static function init(): void
     {
@@ -30,6 +31,101 @@ final class Corehash_Agent
         add_action('activated_plugin', [__CLASS__, 'flush']);
         add_action('deactivated_plugin', [__CLASS__, 'flush']);
         add_action('switch_theme', [__CLASS__, 'flush']);
+
+        // self-hosted updates + "View details"
+        add_filter('pre_set_site_transient_update_plugins', [__CLASS__, 'check_update']);
+        add_filter('plugins_api', [__CLASS__, 'plugin_info'], 20, 3);
+        add_filter('auto_update_plugin', [__CLASS__, 'auto_update'], 10, 2);
+        add_action('upgrader_process_complete', [__CLASS__, 'flush_update_cache'], 10, 2);
+    }
+
+    /* ---------- updates ---------- */
+
+    private static function remote_info(): ?object
+    {
+        $cached = get_site_transient('corehash_agent_update');
+
+        if (is_object($cached)) return $cached;
+
+        $res = wp_remote_get(self::UPDATE_URL, ['timeout' => 10, 'headers' => ['Accept' => 'application/json']]);
+
+        if (is_wp_error($res) || wp_remote_retrieve_response_code($res) !== 200) return null;
+
+        $info = json_decode(wp_remote_retrieve_body($res));
+
+        if (!is_object($info) || empty($info->version)) return null;
+
+        set_site_transient('corehash_agent_update', $info, 6 * HOUR_IN_SECONDS);
+
+        return $info;
+    }
+
+    public static function check_update($transient)
+    {
+        if (empty($transient->checked)) return $transient;
+
+        $info = self::remote_info();
+        $file = plugin_basename(__FILE__);
+
+        if (!$info) return $transient;
+
+        $item = (object) [
+            'id'            => 'corehash.app/agent',
+            'slug'          => 'corehash-agent',
+            'plugin'        => $file,
+            'new_version'   => $info->version,
+            'url'           => 'https://corehash.app',
+            'package'       => $info->download_url,
+            'tested'        => $info->tested ?? '',
+            'requires_php'  => $info->requires_php ?? '8.0',
+            'icons'         => (array) ($info->icons ?? []),
+        ];
+
+        if (version_compare($info->version, self::VERSION, '>')) {
+            $transient->response[$file] = $item;
+        } else {
+            $transient->no_update[$file] = $item;
+        }
+
+        return $transient;
+    }
+
+    public static function plugin_info($result, $action, $args)
+    {
+        if ($action !== 'plugin_information' || ($args->slug ?? '') !== 'corehash-agent') return $result;
+
+        $info = self::remote_info();
+
+        if (!$info) return $result;
+
+        return (object) [
+            'name'            => 'Corehash Agent',
+            'slug'            => 'corehash-agent',
+            'version'         => $info->version,
+            'author'          => '<a href="https://corehash.app">Corehash</a>',
+            'homepage'        => 'https://corehash.app',
+            'requires'        => $info->requires ?? '6.0',
+            'tested'          => $info->tested ?? '',
+            'requires_php'    => $info->requires_php ?? '8.0',
+            'last_updated'    => $info->last_updated ?? '',
+            'download_link'   => $info->download_url,
+            'sections'        => (array) ($info->sections ?? []),
+            'banners'         => (array) ($info->banners ?? []),
+            'icons'           => (array) ($info->icons ?? []),
+        ];
+    }
+
+    /** Agent altijd automatisch bijwerken: het is een monitoring-component, geen site-functionaliteit. */
+    public static function auto_update($update, $item)
+    {
+        if (($item->slug ?? '') === 'corehash-agent') return true;
+
+        return $update;
+    }
+
+    public static function flush_update_cache($upgrader, $options): void
+    {
+        if (($options['type'] ?? '') === 'plugin') delete_site_transient('corehash_agent_update');
     }
 
     /* ---------- token ---------- */
