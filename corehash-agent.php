@@ -3,7 +3,7 @@
  * Plugin Name: Corehash Agent
  * Plugin URI:  https://corehash.app
  * Description: Connects this site to Corehash. Exposes one secured REST endpoint with an inventory of versions, plugins and file hashes.
- * Version:     0.6.1
+ * Version:     0.7.0
  * Author:      Corehash
  * Author URI:  https://corehash.app
  * License:     GPL-2.0-or-later
@@ -14,7 +14,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Corehash_Agent
 {
-    const VERSION      = '0.6.1';
+    const VERSION      = '0.7.0';
     const OPTION_TOKEN = 'corehash_token';
     const OPTION_SEEN  = 'corehash_last_contact';
     const OPTION_EVENTS = 'corehash_events';
@@ -24,6 +24,8 @@ final class Corehash_Agent
     const OPTION_HOT    = 'corehash_hot';
     const OPTION_LOGINS = 'corehash_logins';
     const PUSH_URL      = 'https://corehash.app/agent/event';
+    const ENROLL_URL    = 'https://corehash.app/agent/enroll';
+    const OPTION_ENROLL = 'corehash_enrolled';
     const HOT_INTERVAL  = 300; // seconden tussen twee hot scans
     const ROOT_FILES    = ['index.php', 'wp-config.php', '.htaccess', 'wp-login.php'];
     const TRANSIENT    = 'corehash_inventory';
@@ -40,6 +42,7 @@ final class Corehash_Agent
         add_filter('rest_post_dispatch', [__CLASS__, 'no_cache_response'], 10, 3);
         add_action('admin_menu', [__CLASS__, 'menu']);
         add_action('admin_post_corehash_regenerate', [__CLASS__, 'regenerate']);
+        add_action('admin_post_corehash_enroll', [__CLASS__, 'enroll_now']);
         add_action('upgrader_process_complete', [__CLASS__, 'flush']);
         add_action('activated_plugin', [__CLASS__, 'flush']);
         add_action('deactivated_plugin', [__CLASS__, 'flush']);
@@ -64,6 +67,7 @@ final class Corehash_Agent
         // push + periodieke scan van de gevoelige paden
         add_filter('cron_schedules', [__CLASS__, 'cron_interval']);
         add_action('corehash_hot_scan', [__CLASS__, 'hot_scan']);
+        add_action('corehash_enroll', [__CLASS__, 'enroll']);
         add_action('shutdown', [__CLASS__, 'flush_queue']);
 
         if (!wp_next_scheduled('corehash_hot_scan')) {
@@ -72,6 +76,12 @@ final class Corehash_Agent
 
         if (!get_option('corehash_tracking_since')) {
             update_option('corehash_tracking_since', time(), false);
+        }
+
+        // Aanmelden bij het bureau-account als er een sleutel is en we
+        // nog niet bekend zijn. Eén poging per uur, in de achtergrond.
+        if (self::enroll_key() && !get_option(self::OPTION_ENROLL) && !wp_next_scheduled('corehash_enroll')) {
+            wp_schedule_single_event(time() + 30, 'corehash_enroll');
         }
 
         // self-hosted updates + "View details"
@@ -213,6 +223,22 @@ final class Corehash_Agent
         $schedules['corehash_5min'] = ['interval' => self::HOT_INTERVAL, 'display' => 'Every 5 minutes (Corehash)'];
 
         return $schedules;
+    }
+
+    public static function enroll_now(): void
+    {
+        if (!current_user_can('manage_options')) wp_die('Access denied.');
+        check_admin_referer('corehash_enroll');
+
+        if (!defined('COREHASH_ENROLL_KEY')) {
+            update_option('corehash_enroll_key', sanitize_text_field(wp_unslash($_POST['key'] ?? '')), false);
+        }
+
+        delete_option('corehash_enroll_error');
+        self::enroll();
+
+        wp_safe_redirect(admin_url('options-general.php?page=corehash'));
+        exit;
     }
 
     private static function new_token(): string
@@ -699,6 +725,75 @@ final class Corehash_Agent
         // blijven proberen heeft geen zin. Al het andere: bewaren.
         if (($code >= 200 && $code < 300) || in_array($code, [401, 403, 404], true)) {
             update_option(self::OPTION_QUEUE, [], false);
+        }
+    }
+
+    /* ---------- massa-aanmelding ---------- */
+
+    /**
+     * De accountsleutel komt uit wp-config.php, uit een filter of uit de
+     * instellingenpagina. Zo kun je hem meegeven bij een uitrol over
+     * honderden sites zonder per site iets in te vullen.
+     */
+    private static function enroll_key(): string
+    {
+        if (defined('COREHASH_ENROLL_KEY') && COREHASH_ENROLL_KEY) return (string) COREHASH_ENROLL_KEY;
+
+        $key = (string) get_option('corehash_enroll_key', '');
+
+        return (string) apply_filters('corehash_enroll_key', $key);
+    }
+
+    /**
+     * Meldt deze site aan bij het account van het bureau. Het platform
+     * controleert zelf of wij op deze URL met dit token antwoorden, dus
+     * een gestolen sleutel levert nog geen site op die niet bestaat.
+     */
+    public static function enroll(): void
+    {
+        if (get_option(self::OPTION_ENROLL)) return;
+
+        $key = self::enroll_key();
+
+        if (!$key) return;
+
+        $token = get_option(self::OPTION_TOKEN);
+
+        if (!$token) {
+            update_option(self::OPTION_TOKEN, $token = self::new_token(), false);
+        }
+
+        $res = wp_remote_post(apply_filters('corehash_enroll_url', self::ENROLL_URL), [
+            'timeout' => 20,
+            'headers' => ['X-Corehash-Enroll' => $key, 'Content-Type' => 'application/json'],
+            'body'    => wp_json_encode([
+                'url'   => home_url(),
+                'name'  => get_bloginfo('name'),
+                'token' => $token,
+                'agent' => self::VERSION,
+            ]),
+        ]);
+
+        $code = is_wp_error($res) ? 0 : (int) wp_remote_retrieve_response_code($res);
+        $body = is_wp_error($res) ? [] : (array) json_decode(wp_remote_retrieve_body($res), true);
+
+        if ($code === 200 && !empty($body['ok'])) {
+            update_option(self::OPTION_ENROLL, ['at' => time(), 'account' => $body['account'] ?? '', 'site_id' => $body['site_id'] ?? null], false);
+
+            return;
+        }
+
+        // 401 of 403: de sleutel deugt niet of het account zit vol. Dan
+        // heeft blijven proberen geen zin tot iemand ingrijpt.
+        if (in_array($code, [401, 403], true)) {
+            update_option('corehash_enroll_error', $body['error'] ?? 'rejected', false);
+
+            return;
+        }
+
+        // Al het andere is tijdelijk: over een uur nog eens.
+        if (!wp_next_scheduled('corehash_enroll')) {
+            wp_schedule_single_event(time() + HOUR_IN_SECONDS, 'corehash_enroll');
         }
     }
 
@@ -1213,6 +1308,32 @@ final class Corehash_Agent
                 <?php wp_nonce_field('corehash_regenerate') ?>
                 <?php submit_button('Generate new token', 'secondary') ?>
             </form>
+
+            <hr>
+
+            <h2>Add this site automatically</h2>
+
+            <?php $enrolled = (array) get_option(self::OPTION_ENROLL, []); $err = get_option('corehash_enroll_error'); ?>
+
+            <?php if ($enrolled): ?>
+                <p>This site added itself to <strong><?= esc_html($enrolled['account'] ?? 'your Corehash account') ?></strong> <?= human_time_diff($enrolled['at'] ?? time()) ?> ago. Nothing else to do.</p>
+            <?php else: ?>
+                <p>Paste the enrollment key from your Corehash profile and this site adds itself, no copying tokens around. For a bulk rollout put <code>define('COREHASH_ENROLL_KEY', '...');</code> in wp-config.php instead and skip this screen entirely.</p>
+
+                <?php if ($err): ?>
+                    <div class="notice notice-error inline"><p>Last attempt was rejected: <?= esc_html($err) ?></p></div>
+                <?php endif; ?>
+
+                <form method="post" action="<?= admin_url('admin-post.php') ?>">
+                    <input type="hidden" name="action" value="corehash_enroll">
+                    <?php wp_nonce_field('corehash_enroll') ?>
+                    <input type="text" name="key" class="regular-text code" placeholder="Enrollment key" value="<?= esc_attr(get_option('corehash_enroll_key', '')) ?>"<?= defined('COREHASH_ENROLL_KEY') ? ' disabled' : '' ?>>
+                    <?php if (defined('COREHASH_ENROLL_KEY')): ?>
+                        <p class="description">A key is already set in wp-config.php.</p>
+                    <?php endif; ?>
+                    <?php submit_button('Add this site to Corehash', 'primary') ?>
+                </form>
+            <?php endif; ?>
         </div>
         <?php
     }
