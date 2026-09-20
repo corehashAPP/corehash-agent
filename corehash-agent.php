@@ -3,7 +3,7 @@
  * Plugin Name: Corehash Agent
  * Plugin URI:  https://corehash.app
  * Description: Connects this site to Corehash. Exposes one secured REST endpoint with an inventory of versions, plugins and file hashes.
- * Version:     0.3.0
+ * Version:     0.3.2
  * Author:      Corehash
  * Author URI:  https://corehash.app
  * License:     GPL-2.0-or-later
@@ -14,8 +14,9 @@ if (!defined('ABSPATH')) exit;
 
 final class Corehash_Agent
 {
-    const VERSION      = '0.3.0';
+    const VERSION      = '0.3.2';
     const OPTION_TOKEN = 'corehash_token';
+    const OPTION_SEEN  = 'corehash_last_contact';
     const TRANSIENT    = 'corehash_inventory';
     const CACHE_TTL    = 50 * MINUTE_IN_SECONDS;
     const NAMESPACE    = 'corehash/v1';
@@ -147,6 +148,7 @@ final class Corehash_Agent
         if (!current_user_can('manage_options')) wp_die('Access denied.');
         check_admin_referer('corehash_regenerate');
         update_option(self::OPTION_TOKEN, self::new_token(), false);
+        delete_option(self::OPTION_SEEN);
         self::flush();
         wp_safe_redirect(admin_url('options-general.php?page=corehash&regenerated=1'));
         exit;
@@ -181,7 +183,11 @@ final class Corehash_Agent
 
         if ($given === '' || $stored === '') return false;
 
-        return hash_equals($stored, $given);
+        if (!hash_equals($stored, $given)) return false;
+
+        update_option(self::OPTION_SEEN, time(), false);
+
+        return true;
     }
 
     public static function inventory(WP_REST_Request $request): WP_REST_Response
@@ -511,6 +517,18 @@ final class Corehash_Agent
                 <div class="notice notice-success"><p>New token generated. Update it in your Corehash dashboard.</p></div>
             <?php endif; ?>
 
+            <?php $seen = (int) get_option(self::OPTION_SEEN); $ok = $seen && $seen > time() - 2 * HOUR_IN_SECONDS; ?>
+            <p style="display:flex;align-items:center;gap:8px;font-size:14px">
+                <span style="width:10px;height:10px;border-radius:50%;background:<?= $ok ? '#16a34a' : ($seen ? '#d97706' : '#bbb') ?>"></span>
+                <?php if (!$seen): ?>
+                    Not connected yet. Add this site in your Corehash dashboard.
+                <?php elseif ($ok): ?>
+                    Connected. Last contacted by Corehash <?= human_time_diff($seen) ?> ago.
+                <?php else: ?>
+                    No contact for <?= human_time_diff($seen) ?>. Check the site in your Corehash dashboard.
+                <?php endif; ?>
+            </p>
+
             <p>Add this site to your Corehash dashboard using the details below.</p>
 
             <table class="form-table">
@@ -536,9 +554,6 @@ final class Corehash_Agent
                 <?php wp_nonce_field('corehash_regenerate') ?>
                 <?php submit_button('Generate new token', 'secondary') ?>
             </form>
-
-            <h2>Test</h2>
-            <pre>curl -H "X-Corehash-Token: <?= $token ?>" "<?= $endpoint ?>?fresh=1"</pre>
         </div>
         <?php
     }
