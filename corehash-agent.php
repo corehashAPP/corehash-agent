@@ -3,7 +3,7 @@
  * Plugin Name: Corehash Agent
  * Plugin URI:  https://corehash.app
  * Description: Connects this site to Corehash. Exposes one secured REST endpoint with an inventory of versions, plugins and file hashes.
- * Version:     0.5.2
+ * Version:     0.5.3
  * Author:      Corehash
  * Author URI:  https://corehash.app
  * License:     GPL-2.0-or-later
@@ -14,7 +14,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Corehash_Agent
 {
-    const VERSION      = '0.5.2';
+    const VERSION      = '0.5.3';
     const OPTION_TOKEN = 'corehash_token';
     const OPTION_SEEN  = 'corehash_last_contact';
     const OPTION_EVENTS = 'corehash_events';
@@ -664,8 +664,28 @@ final class Corehash_Agent
 
         update_option(self::OPTION_FIXES, $fixes, false);
         self::flush();
+        self::purge_host_cache();
 
         return new WP_REST_Response(['ok' => true, 'fixes' => $fixes, 'error' => null]);
+    }
+
+    /**
+     * Pagecaches legen zodat een hardening-wijziging direct zichtbaar is.
+     */
+    private static function purge_host_cache(): void
+    {
+        try {
+            if (function_exists('sg_cachepress_purge_cache')) sg_cachepress_purge_cache();          // SiteGround
+            if (function_exists('rocket_clean_domain'))       rocket_clean_domain();                // WP Rocket
+            if (function_exists('w3tc_flush_all'))            w3tc_flush_all();                     // W3 Total Cache
+            if (function_exists('wp_cache_clear_cache'))      wp_cache_clear_cache();               // WP Super Cache
+            if (function_exists('wpfc_clear_all_cache'))      wpfc_clear_all_cache(true);           // WP Fastest Cache
+            if (class_exists('\\LiteSpeed\\Purge'))           do_action('litespeed_purge_all');     // LiteSpeed
+            if (function_exists('kinsta_cache_purge') || class_exists('Kinsta\\Cache')) do_action('kinsta_cache_purge_all'); // Kinsta
+            if (class_exists('WpeCommon') && method_exists('WpeCommon', 'purge_varnish_cache')) WpeCommon::purge_varnish_cache(); // WP Engine
+            if (function_exists('wp_cache_flush')) wp_cache_flush();
+        } catch (\Throwable) {
+        }
     }
 
     private static function write_mu_plugin(array $fixes): bool
