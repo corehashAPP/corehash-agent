@@ -3,7 +3,7 @@
  * Plugin Name: Corehash Agent
  * Plugin URI:  https://corehash.app
  * Description: Connects this site to Corehash. Exposes one secured REST endpoint with an inventory of versions, plugins and file hashes.
- * Version:     0.5.1
+ * Version:     0.5.2
  * Author:      Corehash
  * Author URI:  https://corehash.app
  * License:     GPL-2.0-or-later
@@ -14,7 +14,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Corehash_Agent
 {
-    const VERSION      = '0.5.1';
+    const VERSION      = '0.5.2';
     const OPTION_TOKEN = 'corehash_token';
     const OPTION_SEEN  = 'corehash_last_contact';
     const OPTION_EVENTS = 'corehash_events';
@@ -30,6 +30,7 @@ final class Corehash_Agent
     {
         register_activation_hook(__FILE__, [__CLASS__, 'activate']);
         add_action('rest_api_init', [__CLASS__, 'routes']);
+        add_filter('rest_post_dispatch', [__CLASS__, 'no_cache_response'], 10, 3);
         add_action('admin_menu', [__CLASS__, 'menu']);
         add_action('admin_post_corehash_regenerate', [__CLASS__, 'regenerate']);
         add_action('upgrader_process_complete', [__CLASS__, 'flush']);
@@ -53,6 +54,18 @@ final class Corehash_Agent
         add_filter('plugins_api', [__CLASS__, 'plugin_info'], 20, 3);
         add_filter('auto_update_plugin', [__CLASS__, 'auto_update'], 10, 2);
         add_action('upgrader_process_complete', [__CLASS__, 'flush_update_cache'], 10, 2);
+    }
+
+    public static function no_cache_response($response, $server, $request)
+    {
+        if (str_starts_with((string) $request->get_route(), '/' . self::NAMESPACE) && $response instanceof WP_HTTP_Response) {
+            $response->header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+            $response->header('Pragma', 'no-cache');
+            $response->header('Expires', 'Wed, 11 Jan 1984 05:00:00 GMT');
+            $response->header('X-Accel-Expires', '0');
+        }
+
+        return $response;
     }
 
     /* ---------- updates ---------- */
@@ -202,6 +215,14 @@ final class Corehash_Agent
 
     public static function auth(WP_REST_Request $request): bool
     {
+        // nooit door host-caches (SiteGround, Kinsta, LiteSpeed, Varnish) laten cachen
+        if (!defined('DONOTCACHEPAGE')) define('DONOTCACHEPAGE', true);
+        if (!defined('DONOTCACHEOBJECT')) define('DONOTCACHEOBJECT', true);
+        nocache_headers();
+        header('X-Accel-Expires: 0');
+        header('X-LiteSpeed-Cache-Control: no-cache');
+        header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+
         if (!self::ip_allowed()) return false;
 
         $given  = (string) $request->get_header('x-corehash-token');
