@@ -3,7 +3,7 @@
  * Plugin Name: Corehash Agent
  * Plugin URI:  https://corehash.app
  * Description: Connects this site to Corehash. Exposes one secured REST endpoint with an inventory of versions, plugins and file hashes.
- * Version:     0.5.0
+ * Version:     0.5.1
  * Author:      Corehash
  * Author URI:  https://corehash.app
  * License:     GPL-2.0-or-later
@@ -14,7 +14,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Corehash_Agent
 {
-    const VERSION      = '0.5.0';
+    const VERSION      = '0.5.1';
     const OPTION_TOKEN = 'corehash_token';
     const OPTION_SEEN  = 'corehash_last_contact';
     const OPTION_EVENTS = 'corehash_events';
@@ -280,7 +280,8 @@ final class Corehash_Agent
             'suspicious'   => self::suspicious(),
             'events'       => self::events(),
             'backup'       => self::backup(),
-            'fixes'        => (array) get_option(self::OPTION_FIXES, []),
+            'fixes'        => file_exists(WPMU_PLUGIN_DIR . '/corehash-hardening.php') ? (array) get_option(self::OPTION_FIXES, []) : [],
+            'mu_writable'  => is_dir(WPMU_PLUGIN_DIR) ? wp_is_writable(WPMU_PLUGIN_DIR) : wp_is_writable(WP_CONTENT_DIR),
             'took_ms'      => (int) round((microtime(true) - $start) * 1000),
         ];
     }
@@ -629,15 +630,21 @@ final class Corehash_Agent
             return new WP_REST_Response(['ok' => false, 'error' => 'unknown action'], 400);
         }
 
-        $fixes = (array) get_option(self::OPTION_FIXES, []);
+        $previous = (array) get_option(self::OPTION_FIXES, []);
+        $fixes    = $previous;
         $fixes[$action] = $enable;
         $fixes = array_filter($fixes);
-        update_option(self::OPTION_FIXES, $fixes, false);
 
         $written = self::write_mu_plugin($fixes);
+
+        if (!$written) {
+            return new WP_REST_Response(['ok' => false, 'fixes' => $previous, 'error' => 'Cannot write to ' . WPMU_PLUGIN_DIR . ' (permissions). Create the folder and make it writable, or apply this fix manually.'], 200);
+        }
+
+        update_option(self::OPTION_FIXES, $fixes, false);
         self::flush();
 
-        return new WP_REST_Response(['ok' => $written, 'fixes' => $fixes, 'error' => $written ? null : 'mu-plugins directory not writable']);
+        return new WP_REST_Response(['ok' => true, 'fixes' => $fixes, 'error' => null]);
     }
 
     private static function write_mu_plugin(array $fixes): bool
@@ -650,6 +657,8 @@ final class Corehash_Agent
         }
 
         if (!is_dir($dir) && !@mkdir($dir, 0755, true)) return false;
+        if (!wp_is_writable($dir)) @chmod($dir, 0755);
+        if (!wp_is_writable($dir)) return false;
 
         $php = "<?php\n/**\n * Plugin Name: Corehash Hardening\n * Description: Managed by the Corehash Agent. Do not edit; change settings in your Corehash dashboard.\n */\nif (!defined('ABSPATH')) exit;\n";
 
@@ -657,7 +666,7 @@ final class Corehash_Agent
             $php .= "add_filter('xmlrpc_enabled', '__return_false');\nadd_filter('wp_headers', function (\$h) { unset(\$h['X-Pingback']); return \$h; });\n";
         }
         if (!empty($fixes['hide_rest_users'])) {
-            $php .= "add_filter('rest_endpoints', function (\$e) { if (!is_user_logged_in()) { unset(\$e['/wp/v2/users'], \$e['/wp/v2/users/(?P<id>[\\d]+)']); } return \$e; });\nadd_action('init', function () { if (!is_admin() && isset(\$_GET['author']) && !is_user_logged_in()) { wp_redirect(home_url(), 301); exit; } });\n";
+            $php .= "add_filter('rest_endpoints', function (\$e) { if (!is_user_logged_in()) { foreach (array_keys(\$e) as \$k) { if (str_starts_with(\$k, '/wp/v2/users')) unset(\$e[\$k]); } } return \$e; });\nadd_filter('rest_pre_dispatch', function (\$r, \$s, \$req) { if (!is_user_logged_in() && str_starts_with(\$req->get_route(), '/wp/v2/users')) { return new WP_Error('rest_no_route', 'No route was found matching the URL and request method.', ['status' => 404]); } return \$r; }, 10, 3);\nadd_action('init', function () { if (!is_admin() && isset(\$_GET['author']) && !is_user_logged_in()) { wp_redirect(home_url(), 301); exit; } });\nadd_filter('oembed_response_data', function (\$d) { unset(\$d['author_name'], \$d['author_url']); return \$d; });\n";
         }
         if (!empty($fixes['disallow_file_edit'])) {
             $php .= "if (!defined('DISALLOW_FILE_EDIT')) define('DISALLOW_FILE_EDIT', true);\n";
