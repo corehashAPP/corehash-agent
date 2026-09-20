@@ -3,7 +3,7 @@
  * Plugin Name: Corehash Agent
  * Plugin URI:  https://corehash.app
  * Description: Connects this site to Corehash. Exposes one secured REST endpoint with an inventory of versions, plugins and file hashes.
- * Version:     0.4.0
+ * Version:     0.5.0
  * Author:      Corehash
  * Author URI:  https://corehash.app
  * License:     GPL-2.0-or-later
@@ -14,9 +14,12 @@ if (!defined('ABSPATH')) exit;
 
 final class Corehash_Agent
 {
-    const VERSION      = '0.4.0';
+    const VERSION      = '0.5.0';
     const OPTION_TOKEN = 'corehash_token';
     const OPTION_SEEN  = 'corehash_last_contact';
+    const OPTION_EVENTS = 'corehash_events';
+    const OPTION_FIXES  = 'corehash_fixes';
+    const MAX_EVENTS    = 300;
     const TRANSIENT    = 'corehash_inventory';
     const CACHE_TTL    = 50 * MINUTE_IN_SECONDS;
     const NAMESPACE    = 'corehash/v1';
@@ -33,6 +36,17 @@ final class Corehash_Agent
         add_action('activated_plugin', [__CLASS__, 'flush']);
         add_action('deactivated_plugin', [__CLASS__, 'flush']);
         add_action('switch_theme', [__CLASS__, 'flush']);
+
+        // security events (login monitoring)
+        add_action('wp_login_failed', [__CLASS__, 'ev_login_failed']);
+        add_action('wp_login', [__CLASS__, 'ev_login'], 10, 2);
+        add_action('after_password_reset', fn($u) => self::event('password_reset', ['user' => $u->user_login]));
+        add_action('profile_update', [__CLASS__, 'ev_profile_update'], 10, 2);
+        add_action('set_user_role', [__CLASS__, 'ev_role'], 10, 3);
+        add_action('user_register', fn($id) => self::event('user_created', ['user' => get_userdata($id)->user_login ?? $id, 'role' => implode(',', get_userdata($id)->roles ?? [])]));
+        add_action('deleted_user', fn($id, $r, $u) => self::event('user_deleted', ['user' => $u->user_login ?? $id]), 10, 3);
+        add_action('activated_plugin', fn($f) => self::event('plugin_activated', ['plugin' => $f]));
+        add_action('deactivated_plugin', fn($f) => self::event('plugin_deactivated', ['plugin' => $f]));
 
         // self-hosted updates + "View details"
         add_filter('pre_set_site_transient_update_plugins', [__CLASS__, 'check_update']);
@@ -173,6 +187,12 @@ final class Corehash_Agent
             'permission_callback' => [__CLASS__, 'auth'],
         ]);
 
+        register_rest_route(self::NAMESPACE, '/fix', [
+            'methods'             => 'POST',
+            'callback'            => [__CLASS__, 'fix'],
+            'permission_callback' => [__CLASS__, 'auth'],
+        ]);
+
         register_rest_route(self::NAMESPACE, '/ping', [
             'methods'             => 'GET',
             'callback'            => fn() => ['ok' => true, 'agent' => self::VERSION],
@@ -258,6 +278,9 @@ final class Corehash_Agent
             'core'         => self::core_integrity(),
             'content'      => self::content_hashes(),
             'suspicious'   => self::suspicious(),
+            'events'       => self::events(),
+            'backup'       => self::backup(),
+            'fixes'        => (array) get_option(self::OPTION_FIXES, []),
             'took_ms'      => (int) round((microtime(true) - $start) * 1000),
         ];
     }
@@ -490,6 +513,160 @@ final class Corehash_Agent
         }
 
         return $out;
+    }
+
+    /* ---------- events ---------- */
+
+    private static function ip(): string
+    {
+        foreach (['HTTP_CF_CONNECTING_IP', 'HTTP_X_REAL_IP'] as $h) {
+            if (!empty($_SERVER[$h]) && filter_var($_SERVER[$h], FILTER_VALIDATE_IP)) return $_SERVER[$h];
+        }
+
+        if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+            $first = trim(explode(',', $_SERVER['HTTP_X_FORWARDED_FOR'])[0]);
+            if (filter_var($first, FILTER_VALIDATE_IP)) return $first;
+        }
+
+        return $_SERVER['REMOTE_ADDR'] ?? '';
+    }
+
+    private static function event(string $type, array $data = []): void
+    {
+        $events   = (array) get_option(self::OPTION_EVENTS, []);
+        $events[] = ['t' => time(), 'type' => $type, 'ip' => self::ip(), 'ua' => mb_substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 120)] + $data;
+
+        if (count($events) > self::MAX_EVENTS) {
+            $events = array_slice($events, -self::MAX_EVENTS);
+        }
+
+        update_option(self::OPTION_EVENTS, $events, false);
+    }
+
+    public static function ev_login_failed($username): void
+    {
+        self::event('login_failed', ['user' => mb_substr((string) $username, 0, 60)]);
+    }
+
+    public static function ev_login($login, $user): void
+    {
+        self::event('login', ['user' => $login, 'admin' => in_array('administrator', (array) $user->roles, true)]);
+    }
+
+    public static function ev_profile_update($id, $old): void
+    {
+        $new = get_userdata($id);
+        if (!$new) return;
+
+        $changes = [];
+        if ($old->user_email !== $new->user_email) $changes[] = 'email';
+        if ($old->user_pass !== $new->user_pass)   $changes[] = 'password';
+
+        if ($changes) {
+            self::event('profile_changed', ['user' => $new->user_login, 'changed' => implode(',', $changes), 'admin' => in_array('administrator', (array) $new->roles, true)]);
+        }
+    }
+
+    public static function ev_role($id, $role, $old): void
+    {
+        self::event('role_changed', ['user' => get_userdata($id)->user_login ?? $id, 'from' => implode(',', (array) $old), 'to' => $role]);
+    }
+
+    private static function events(): array
+    {
+        return (array) get_option(self::OPTION_EVENTS, []);
+    }
+
+    /* ---------- backup ---------- */
+
+    private static function backup(): array
+    {
+        // UpdraftPlus
+        $u = get_option('updraft_last_backup');
+        if (is_array($u) && !empty($u['backup_time'])) {
+            return ['plugin' => 'UpdraftPlus', 'last' => (int) $u['backup_time'], 'ok' => !empty($u['success'])];
+        }
+
+        // BackWPup
+        $jobs = get_option('backwpup_jobs');
+        if (is_array($jobs) && $jobs) {
+            $last = max(array_map(fn($j) => (int) ($j['lastrun'] ?? 0), $jobs));
+            $ok   = max(array_map(fn($j) => (int) ($j['lastruntime'] ?? 0), $jobs)) > 0;
+            if ($last) return ['plugin' => 'BackWPup', 'last' => $last, 'ok' => $ok];
+        }
+
+        // WPvivid
+        $w = get_option('wpvivid_last_msg');
+        if (is_array($w) && !empty($w['time'])) {
+            return ['plugin' => 'WPvivid', 'last' => (int) $w['time'], 'ok' => ($w['status'] ?? '') === 'completed'];
+        }
+
+        // Duplicator Pro schedules
+        if (defined('DUPLICATOR_PRO_VERSION')) {
+            return ['plugin' => 'Duplicator Pro', 'last' => null, 'ok' => null];
+        }
+
+        // Host-level backups (SiteGround, Kinsta, WP Engine): niet zichtbaar vanuit WP
+        foreach (['sg-cachepress/sg-cachepress.php', 'kinsta-mu-plugins/kinsta-mu-plugins.php', 'wpengine-common/plugin.php'] as $host) {
+            if (file_exists(WP_PLUGIN_DIR . '/' . $host) || file_exists(WPMU_PLUGIN_DIR . '/' . $host)) {
+                return ['plugin' => 'host', 'last' => null, 'ok' => null];
+            }
+        }
+
+        return ['plugin' => null, 'last' => null, 'ok' => null];
+    }
+
+    /* ---------- fixes (hardening via mu-plugin) ---------- */
+
+    const FIXES = ['disable_xmlrpc', 'hide_rest_users', 'disallow_file_edit', 'security_headers'];
+
+    public static function fix(WP_REST_Request $request)
+    {
+        $action = (string) $request->get_param('action');
+        $enable = (bool) $request->get_param('enable');
+
+        if (!in_array($action, self::FIXES, true)) {
+            return new WP_REST_Response(['ok' => false, 'error' => 'unknown action'], 400);
+        }
+
+        $fixes = (array) get_option(self::OPTION_FIXES, []);
+        $fixes[$action] = $enable;
+        $fixes = array_filter($fixes);
+        update_option(self::OPTION_FIXES, $fixes, false);
+
+        $written = self::write_mu_plugin($fixes);
+        self::flush();
+
+        return new WP_REST_Response(['ok' => $written, 'fixes' => $fixes, 'error' => $written ? null : 'mu-plugins directory not writable']);
+    }
+
+    private static function write_mu_plugin(array $fixes): bool
+    {
+        $dir  = WPMU_PLUGIN_DIR;
+        $file = $dir . '/corehash-hardening.php';
+
+        if (empty($fixes)) {
+            return !file_exists($file) || @unlink($file);
+        }
+
+        if (!is_dir($dir) && !@mkdir($dir, 0755, true)) return false;
+
+        $php = "<?php\n/**\n * Plugin Name: Corehash Hardening\n * Description: Managed by the Corehash Agent. Do not edit; change settings in your Corehash dashboard.\n */\nif (!defined('ABSPATH')) exit;\n";
+
+        if (!empty($fixes['disable_xmlrpc'])) {
+            $php .= "add_filter('xmlrpc_enabled', '__return_false');\nadd_filter('wp_headers', function (\$h) { unset(\$h['X-Pingback']); return \$h; });\n";
+        }
+        if (!empty($fixes['hide_rest_users'])) {
+            $php .= "add_filter('rest_endpoints', function (\$e) { if (!is_user_logged_in()) { unset(\$e['/wp/v2/users'], \$e['/wp/v2/users/(?P<id>[\\d]+)']); } return \$e; });\nadd_action('init', function () { if (!is_admin() && isset(\$_GET['author']) && !is_user_logged_in()) { wp_redirect(home_url(), 301); exit; } });\n";
+        }
+        if (!empty($fixes['disallow_file_edit'])) {
+            $php .= "if (!defined('DISALLOW_FILE_EDIT')) define('DISALLOW_FILE_EDIT', true);\n";
+        }
+        if (!empty($fixes['security_headers'])) {
+            $php .= "add_action('send_headers', function () { if (is_ssl()) header('Strict-Transport-Security: max-age=31536000'); header('X-Content-Type-Options: nosniff'); header('X-Frame-Options: SAMEORIGIN'); header('Referrer-Policy: strict-origin-when-cross-origin'); });\n";
+        }
+
+        return (bool) @file_put_contents($file, $php);
     }
 
     /* ---------- helpers ---------- */
