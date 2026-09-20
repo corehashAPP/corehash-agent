@@ -4,7 +4,7 @@ Tags: security, monitoring, malware, vulnerability, integrity
 Requires at least: 6.0
 Tested up to: 7.1
 Requires PHP: 8.0
-Stable tag: 0.5.3
+Stable tag: 0.6.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -14,9 +14,9 @@ Connects this site to Corehash, security monitoring for WordPress agencies.
 
 The Corehash Agent exposes one secured REST endpoint that returns an inventory of this site: WordPress, PHP and plugin versions, core file checksums, hashes of PHP files in wp-content, and a few quick malware signals. Corehash polls this endpoint hourly and alerts your agency when something changes.
 
-The plugin does nothing on normal page views. It only responds to requests carrying the site's secret token.
+Since 0.6.0 the plugin also pushes: when something happens that almost never happens by itself (a new administrator, a plugin installed, a file edited through the editor, the site URL changed, PHP appearing in the uploads folder) it notifies Corehash immediately instead of waiting for the next hourly check. A small scan every five minutes covers the folders where hacks land.
 
-No data is sent anywhere by the plugin itself; Corehash pulls it.
+Apart from those notifications the plugin does nothing on normal page views, and it only answers requests carrying the site's secret token.
 
 == Installation ==
 
@@ -35,6 +35,13 @@ No. The inventory is only built when Corehash asks for it, roughly once an hour,
 Version numbers, plugin and theme names, file hashes and admin usernames. Never file contents, never database content.
 
 == Changelog ==
+
+= 0.6.0 =
+* Real-time notifications for high-risk changes, pushed to Corehash as they happen
+* Five-minute integrity scan of uploads, mu-plugins and the root files
+* Verifies plugins from wordpress.org against the official per-file checksums
+* Restore a modified plugin file from the official source, keeping a backup
+* Every event now records who was logged in, or that nobody was
 
 = 0.5.3 =
 * Purge host page cache after a hardening change (SiteGround, LiteSpeed, WP Rocket, W3TC, Super Cache, Kinsta, WP Engine)

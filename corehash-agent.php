@@ -3,7 +3,7 @@
  * Plugin Name: Corehash Agent
  * Plugin URI:  https://corehash.app
  * Description: Connects this site to Corehash. Exposes one secured REST endpoint with an inventory of versions, plugins and file hashes.
- * Version:     0.5.3
+ * Version:     0.6.0
  * Author:      Corehash
  * Author URI:  https://corehash.app
  * License:     GPL-2.0-or-later
@@ -14,12 +14,17 @@ if (!defined('ABSPATH')) exit;
 
 final class Corehash_Agent
 {
-    const VERSION      = '0.5.3';
+    const VERSION      = '0.6.0';
     const OPTION_TOKEN = 'corehash_token';
     const OPTION_SEEN  = 'corehash_last_contact';
     const OPTION_EVENTS = 'corehash_events';
     const OPTION_FIXES  = 'corehash_fixes';
     const MAX_EVENTS    = 300;
+    const OPTION_QUEUE  = 'corehash_queue';
+    const OPTION_HOT    = 'corehash_hot';
+    const PUSH_URL      = 'https://corehash.app/agent/event';
+    const HOT_INTERVAL  = 300; // seconden tussen twee hot scans
+    const ROOT_FILES    = ['index.php', 'wp-config.php', '.htaccess', 'wp-login.php'];
     const TRANSIENT    = 'corehash_inventory';
     const CACHE_TTL    = 50 * MINUTE_IN_SECONDS;
     const NAMESPACE    = 'corehash/v1';
@@ -29,6 +34,7 @@ final class Corehash_Agent
     public static function init(): void
     {
         register_activation_hook(__FILE__, [__CLASS__, 'activate']);
+        register_deactivation_hook(__FILE__, [__CLASS__, 'deactivate']);
         add_action('rest_api_init', [__CLASS__, 'routes']);
         add_filter('rest_post_dispatch', [__CLASS__, 'no_cache_response'], 10, 3);
         add_action('admin_menu', [__CLASS__, 'menu']);
@@ -48,6 +54,20 @@ final class Corehash_Agent
         add_action('deleted_user', fn($id, $r, $u) => self::event('user_deleted', ['user' => $u->user_login ?? $id]), 10, 3);
         add_action('activated_plugin', fn($f) => self::event('plugin_activated', ['plugin' => $f]));
         add_action('deactivated_plugin', fn($f) => self::event('plugin_deactivated', ['plugin' => $f]));
+
+        // real-time: wijzigingen die vrijwel nooit vanzelf gebeuren
+        add_action('upgrader_process_complete', [__CLASS__, 'ev_upgrade'], 10, 2);
+        add_action('updated_option', [__CLASS__, 'ev_option'], 10, 3);
+        add_action('wp_ajax_edit-theme-plugin-file', [__CLASS__, 'ev_editor'], 1);
+
+        // push + periodieke scan van de gevoelige paden
+        add_filter('cron_schedules', [__CLASS__, 'cron_interval']);
+        add_action('corehash_hot_scan', [__CLASS__, 'hot_scan']);
+        add_action('shutdown', [__CLASS__, 'flush_queue']);
+
+        if (!wp_next_scheduled('corehash_hot_scan')) {
+            wp_schedule_event(time() + 60, 'corehash_5min', 'corehash_hot_scan');
+        }
 
         // self-hosted updates + "View details"
         add_filter('pre_set_site_transient_update_plugins', [__CLASS__, 'check_update']);
@@ -167,6 +187,23 @@ final class Corehash_Agent
         if (!get_option(self::OPTION_TOKEN)) {
             update_option(self::OPTION_TOKEN, self::new_token(), false);
         }
+
+        if (!wp_next_scheduled('corehash_hot_scan')) {
+            wp_schedule_event(time() + 60, 'corehash_5min', 'corehash_hot_scan');
+        }
+    }
+
+    public static function deactivate(): void
+    {
+        $ts = wp_next_scheduled('corehash_hot_scan');
+        if ($ts) wp_unschedule_event($ts, 'corehash_hot_scan');
+    }
+
+    public static function cron_interval(array $schedules): array
+    {
+        $schedules['corehash_5min'] = ['interval' => self::HOT_INTERVAL, 'display' => 'Every 5 minutes (Corehash)'];
+
+        return $schedules;
     }
 
     private static function new_token(): string
@@ -299,6 +336,12 @@ final class Corehash_Agent
             'core'         => self::core_integrity(),
             'content'      => self::content_hashes(),
             'suspicious'   => self::suspicious(),
+            'integrity'    => self::wporg_integrity(),
+            'realtime'     => [
+                'hot'    => count((array) get_option(self::OPTION_HOT, [])),
+                'queued' => count((array) get_option(self::OPTION_QUEUE, [])),
+                'next'   => wp_next_scheduled('corehash_hot_scan') ?: null,
+            ],
             'events'       => self::events(),
             'backup'       => self::backup(),
             'fixes'        => file_exists(WPMU_PLUGIN_DIR . '/corehash-hardening.php') ? (array) get_option(self::OPTION_FIXES, []) : [],
@@ -555,14 +598,346 @@ final class Corehash_Agent
 
     private static function event(string $type, array $data = []): void
     {
+        $row = ['t' => time(), 'type' => $type, 'ip' => self::ip(), 'ua' => mb_substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 120)] + $data;
+
+        // Wie deed dit? Een wijziging zonder ingelogde gebruiker weegt zwaarder.
+        $user = function_exists('wp_get_current_user') ? wp_get_current_user() : null;
+
+        if ($user && $user->ID) {
+            $row['by']   = $user->user_login;
+            $row['role'] = implode(',', (array) $user->roles);
+        }
+
         $events   = (array) get_option(self::OPTION_EVENTS, []);
-        $events[] = ['t' => time(), 'type' => $type, 'ip' => self::ip(), 'ua' => mb_substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 120)] + $data;
+        $events[] = $row;
 
         if (count($events) > self::MAX_EVENTS) {
             $events = array_slice($events, -self::MAX_EVENTS);
         }
 
         update_option(self::OPTION_EVENTS, $events, false);
+
+        if (self::urgent($type, $row)) self::queue($row);
+    }
+
+    /* ---------- real-time push ---------- */
+
+    /**
+     * Gebeurtenissen die niet kunnen wachten op de volgende uurlijkse check.
+     */
+    private static function urgent(string $type, array $d): bool
+    {
+        if (in_array($type, ['plugin_installed', 'theme_installed', 'plugin_activated', 'file_edited', 'option_changed', 'file_new', 'file_changed', 'file_removed', 'user_deleted'], true)) {
+            return true;
+        }
+
+        if ($type === 'user_created' && str_contains((string) ($d['role'] ?? ''), 'administrator')) return true;
+        if ($type === 'role_changed' && (string) ($d['to'] ?? '') === 'administrator') return true;
+
+        return false;
+    }
+
+    private static function queue(array $event): void
+    {
+        $q   = (array) get_option(self::OPTION_QUEUE, []);
+        $q[] = $event;
+
+        if (count($q) > 50) $q = array_slice($q, -50);
+
+        update_option(self::OPTION_QUEUE, $q, false);
+    }
+
+    /**
+     * Stuurt de wachtrij naar Corehash. Draait op shutdown, dus na het
+     * antwoord aan de bezoeker. Lukt het niet, dan blijft de rij staan
+     * en probeert de volgende scan het opnieuw.
+     */
+    public static function flush_queue(): void
+    {
+        $q = (array) get_option(self::OPTION_QUEUE, []);
+
+        if (!$q) return;
+
+        $token = get_option(self::OPTION_TOKEN);
+
+        if (!$token) return;
+
+        $res = wp_remote_post(apply_filters('corehash_push_url', self::PUSH_URL), [
+            'timeout'     => 8,
+            'redirection' => 0,
+            'headers'     => ['X-Corehash-Token' => $token, 'Content-Type' => 'application/json'],
+            'body'        => wp_json_encode(['site' => home_url(), 'agent' => self::VERSION, 'events' => array_values($q)]),
+        ]);
+
+        $code = is_wp_error($res) ? 0 : (int) wp_remote_retrieve_response_code($res);
+
+        // 2xx: aangekomen. 401/403/404: dit endpoint kent ons niet, dus
+        // blijven proberen heeft geen zin. Al het andere: bewaren.
+        if (($code >= 200 && $code < 300) || in_array($code, [401, 403, 404], true)) {
+            update_option(self::OPTION_QUEUE, [], false);
+        }
+    }
+
+    /* ---------- hot scan: de plekken waar hacks landen ---------- */
+
+    public static function hot_scan(): void
+    {
+        $prev = (array) get_option(self::OPTION_HOT, []);
+        $now  = [];
+
+        foreach (self::hot_paths() as $rel => $path) {
+            if (!is_readable($path)) continue;
+            $now[$rel] = md5_file($path);
+        }
+
+        // Eerste keer: alleen vastleggen, anders meldt hij de hele site.
+        if ($prev) {
+            $changes = 0;
+
+            foreach ($now as $rel => $hash) {
+                if ($changes >= 25) break;
+
+                if (!isset($prev[$rel])) {
+                    self::event('file_new', ['file' => $rel, 'class' => self::classify($rel)]);
+                    $changes++;
+                } elseif ($prev[$rel] !== $hash) {
+                    self::event('file_changed', ['file' => $rel, 'class' => self::classify($rel)]);
+                    $changes++;
+                }
+            }
+
+            foreach ($prev as $rel => $hash) {
+                if ($changes >= 25) break;
+
+                if (!isset($now[$rel])) {
+                    self::event('file_removed', ['file' => $rel, 'class' => self::classify($rel)]);
+                    $changes++;
+                }
+            }
+        }
+
+        update_option(self::OPTION_HOT, $now, false);
+
+        self::flush_queue();
+    }
+
+    /**
+     * De gevoelige set: klein genoeg om elke vijf minuten te hashen.
+     * Het maatwerk van de developer zit hier bewust niet in.
+     */
+    private static function hot_paths(): array
+    {
+        $out     = [];
+        $uploads = wp_upload_dir()['basedir'] ?? null;
+
+        if ($uploads && is_dir($uploads)) {
+            foreach (self::php_files($uploads) as $p) {
+                $out['uploads/' . ltrim(str_replace($uploads, '', $p), '/')] = $p;
+            }
+
+            if (file_exists($uploads . '/.htaccess')) $out['uploads/.htaccess'] = $uploads . '/.htaccess';
+        }
+
+        if (defined('WPMU_PLUGIN_DIR') && is_dir(WPMU_PLUGIN_DIR)) {
+            foreach (self::php_files(WPMU_PLUGIN_DIR) as $p) {
+                $out['mu-plugins/' . ltrim(str_replace(WPMU_PLUGIN_DIR, '', $p), '/')] = $p;
+            }
+        }
+
+        foreach (self::ROOT_FILES as $f) {
+            $path = ABSPATH . $f;
+
+            // wp-config.php mag één map boven de installatie staan
+            if ($f === 'wp-config.php' && !file_exists($path)) {
+                $path = dirname(ABSPATH) . '/wp-config.php';
+            }
+
+            if (file_exists($path)) $out[$f] = $path;
+        }
+
+        return $out;
+    }
+
+    private static function classify(string $rel): string
+    {
+        if (str_starts_with($rel, 'uploads/'))     return 'uploads';
+        if (str_starts_with($rel, 'mu-plugins/'))  return 'mu';
+        if (in_array($rel, self::ROOT_FILES, true)) return 'root';
+
+        return 'other';
+    }
+
+    /* ---------- integriteit van wordpress.org plugins ---------- */
+
+    /**
+     * wordpress.org publiceert per plugin per versie de md5 van elk bestand.
+     * Wijkt er iets af, dan is dat altijd een signaal: developers horen niet
+     * in plugincode van derden te zitten, aanvallers wel.
+     */
+    private static function wporg_integrity(): array
+    {
+        $out     = [];
+        $checked = 0;
+
+        foreach (self::plugins() as $p) {
+            if ($checked >= 15) break;
+            if (empty($p['wporg']) || empty($p['slug']) || empty($p['version'])) continue;
+            if (!is_dir(WP_PLUGIN_DIR . '/' . $p['slug'])) continue;
+
+            $sums = self::checksums($p['slug'], $p['version']);
+            $checked++;
+
+            if (!$sums) continue;
+
+            $dir = WP_PLUGIN_DIR . '/' . $p['slug'];
+            $bad = [];
+
+            foreach ($sums as $file => $hashes) {
+                if (count($bad) >= 10) break;
+
+                $path = $dir . '/' . $file;
+                $list = array_values(array_filter((array) $hashes, 'is_string'));
+
+                if (!$list) continue;
+
+                if (!file_exists($path)) {
+                    $bad[] = ['file' => $file, 'why' => 'missing'];
+                    continue;
+                }
+
+                if (!in_array(md5_file($path), $list, true)) {
+                    $bad[] = ['file' => $file, 'why' => 'modified'];
+                }
+            }
+
+            if ($bad) {
+                $out[$p['slug']] = ['name' => $p['name'], 'version' => $p['version'], 'files' => $bad];
+            }
+        }
+
+        return $out;
+    }
+
+    private static function checksums(string $slug, string $version): array
+    {
+        $key  = 'corehash_sums_' . md5($slug . '@' . $version);
+        $sums = get_transient($key);
+
+        if (is_array($sums)) return $sums;
+
+        $res  = wp_remote_get('https://api.wordpress.org/plugins/checksums/1.0/?slug=' . rawurlencode($slug) . '&version=' . rawurlencode($version), ['timeout' => 12]);
+        $body = is_wp_error($res) ? null : json_decode(wp_remote_retrieve_body($res), true);
+        $sums = (is_array($body) && !empty($body['files']) && is_array($body['files'])) ? $body['files'] : [];
+
+        set_transient($key, $sums, DAY_IN_SECONDS);
+
+        return $sums;
+    }
+
+    /**
+     * Zet een gewijzigd bestand terug naar de versie van wordpress.org.
+     * Het oude bestand wordt bewaard naast het origineel.
+     */
+    private static function restore(string $slug, string $file): array
+    {
+        $plugins = self::plugins();
+        $version = null;
+
+        foreach ($plugins as $p) {
+            if (($p['slug'] ?? '') === $slug) {
+                $version = $p['version'];
+                break;
+            }
+        }
+
+        if (!$version) return ['ok' => false, 'error' => 'Plugin not installed'];
+
+        $file = ltrim(str_replace('\\', '/', $file), '/');
+
+        if (str_contains($file, '..') || !preg_match('#^[A-Za-z0-9._/-]+$#', $file)) {
+            return ['ok' => false, 'error' => 'Invalid path'];
+        }
+
+        $sums = self::checksums($slug, $version);
+
+        if (!isset($sums[$file])) return ['ok' => false, 'error' => 'File is not part of the official release'];
+
+        $url = 'https://plugins.svn.wordpress.org/' . rawurlencode($slug) . '/tags/' . rawurlencode($version) . '/' . $file;
+        $res = wp_remote_get($url, ['timeout' => 20]);
+
+        if (is_wp_error($res) || (int) wp_remote_retrieve_response_code($res) !== 200) {
+            return ['ok' => false, 'error' => 'Could not download the original file'];
+        }
+
+        $clean = wp_remote_retrieve_body($res);
+        $list  = array_values(array_filter((array) $sums[$file], 'is_string'));
+
+        if ($list && !in_array(md5($clean), $list, true)) {
+            return ['ok' => false, 'error' => 'Downloaded file does not match the official checksum'];
+        }
+
+        $path = WP_PLUGIN_DIR . '/' . $slug . '/' . $file;
+
+        if (file_exists($path) && !@copy($path, $path . '.corehash-bak')) {
+            return ['ok' => false, 'error' => 'Could not back up the current file'];
+        }
+
+        if (@file_put_contents($path, $clean) === false) {
+            return ['ok' => false, 'error' => 'Could not write to ' . $file . ' (permissions)'];
+        }
+
+        self::event('file_restored', ['file' => $slug . '/' . $file, 'class' => 'wporg_plugin']);
+        self::flush();
+
+        return ['ok' => true, 'error' => null, 'backup' => $file . '.corehash-bak'];
+    }
+
+    /* ---------- extra events ---------- */
+
+    public static function ev_upgrade($upgrader, $options): void
+    {
+        $action = $options['action'] ?? '';
+        $type   = $options['type'] ?? '';
+
+        if ($action !== 'install' || !in_array($type, ['plugin', 'theme'], true)) return;
+
+        $name = '';
+
+        if ($type === 'plugin') {
+            $name = $upgrader->plugin_info ? $upgrader->plugin_info() : ($options['plugins'][0] ?? '');
+        } else {
+            $name = $upgrader->theme_info() ? $upgrader->theme_info()->get_stylesheet() : ($options['themes'][0] ?? '');
+        }
+
+        self::event($type . '_installed', [$type => (string) $name]);
+    }
+
+    /**
+     * Instellingen waarmee een site wordt overgenomen: de URL omleggen,
+     * registratie openzetten of iedereen beheerder maken.
+     */
+    public static function ev_option($option, $old, $new): void
+    {
+        $watch = ['siteurl', 'home', 'users_can_register', 'default_role', 'admin_email', 'template', 'stylesheet'];
+
+        if (!in_array($option, $watch, true)) return;
+        if ($old === $new) return;
+
+        self::event('option_changed', [
+            'option' => $option,
+            'from'   => is_scalar($old) ? mb_substr((string) $old, 0, 120) : '',
+            'to'     => is_scalar($new) ? mb_substr((string) $new, 0, 120) : '',
+        ]);
+    }
+
+    public static function ev_editor(): void
+    {
+        $file = isset($_POST['file']) ? sanitize_text_field(wp_unslash($_POST['file'])) : '';
+
+        self::event('file_edited', [
+            'file'   => mb_substr($file, 0, 200),
+            'target' => isset($_POST['plugin']) ? 'plugin' : (isset($_POST['theme']) ? 'theme' : 'unknown'),
+        ]);
     }
 
     public static function ev_login_failed($username): void
@@ -646,6 +1021,12 @@ final class Corehash_Agent
     {
         $action = (string) $request->get_param('action');
         $enable = (bool) $request->get_param('enable');
+
+        if ($action === 'restore_file') {
+            $result = self::restore((string) $request->get_param('slug'), (string) $request->get_param('file'));
+
+            return new WP_REST_Response($result, 200);
+        }
 
         if (!in_array($action, self::FIXES, true)) {
             return new WP_REST_Response(['ok' => false, 'error' => 'unknown action'], 400);
