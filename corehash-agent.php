@@ -3,7 +3,7 @@
  * Plugin Name: Corehash Agent
  * Plugin URI:  https://corehash.app
  * Description: Connects this site to Corehash. Exposes one secured REST endpoint with an inventory of versions, plugins and file hashes.
- * Version:     0.3.2
+ * Version:     0.4.0
  * Author:      Corehash
  * Author URI:  https://corehash.app
  * License:     GPL-2.0-or-later
@@ -14,13 +14,14 @@ if (!defined('ABSPATH')) exit;
 
 final class Corehash_Agent
 {
-    const VERSION      = '0.3.2';
+    const VERSION      = '0.4.0';
     const OPTION_TOKEN = 'corehash_token';
     const OPTION_SEEN  = 'corehash_last_contact';
     const TRANSIENT    = 'corehash_inventory';
     const CACHE_TTL    = 50 * MINUTE_IN_SECONDS;
     const NAMESPACE    = 'corehash/v1';
     const UPDATE_URL   = 'https://corehash.app/agent/update.json';
+    const ALLOWED_IPS  = ['35.214.231.225']; // Corehash-server. Uitbreiden met een filter: corehash_allowed_ips
 
     public static function init(): void
     {
@@ -44,6 +45,9 @@ final class Corehash_Agent
 
     private static function remote_info(): ?object
     {
+        // "Check again" op de Updates-pagina forceert ook onze cache
+        if (!empty($_GET['force-check'])) delete_site_transient('corehash_agent_update');
+
         $cached = get_site_transient('corehash_agent_update');
 
         if (is_object($cached)) return $cached;
@@ -56,7 +60,7 @@ final class Corehash_Agent
 
         if (!is_object($info) || empty($info->version)) return null;
 
-        set_site_transient('corehash_agent_update', $info, 6 * HOUR_IN_SECONDS);
+        set_site_transient('corehash_agent_update', $info, HOUR_IN_SECONDS);
 
         return $info;
     }
@@ -178,6 +182,8 @@ final class Corehash_Agent
 
     public static function auth(WP_REST_Request $request): bool
     {
+        if (!self::ip_allowed()) return false;
+
         $given  = (string) $request->get_header('x-corehash-token');
         $stored = (string) get_option(self::OPTION_TOKEN);
 
@@ -188,6 +194,19 @@ final class Corehash_Agent
         update_option(self::OPTION_SEEN, time(), false);
 
         return true;
+    }
+
+    private static function ip_allowed(): bool
+    {
+        $allowed = apply_filters('corehash_allowed_ips', self::ALLOWED_IPS);
+
+        if (empty($allowed)) return true; // allowlist uitgeschakeld
+
+        $ip = $_SERVER['REMOTE_ADDR'] ?? '';
+
+        // achter Cloudflare / proxy: eerste IP uit X-Forwarded-For alleen vertrouwen als
+        // de directe verbinding zelf van een bekende proxy komt; anders REMOTE_ADDR.
+        return in_array($ip, $allowed, true);
     }
 
     public static function inventory(WP_REST_Request $request): WP_REST_Response

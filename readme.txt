@@ -4,7 +4,7 @@ Tags: security, monitoring, malware, vulnerability, integrity
 Requires at least: 6.0
 Tested up to: 7.1
 Requires PHP: 8.0
-Stable tag: 0.3.2
+Stable tag: 0.4.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -35,6 +35,9 @@ No. The inventory is only built when Corehash asks for it, roughly once an hour,
 Version numbers, plugin and theme names, file hashes and admin usernames. Never file contents, never database content.
 
 == Changelog ==
+
+= 0.4.0 =
+* Only accept requests from the Corehash server (IP allowlist, filter `corehash_allowed_ips`)
 
 = 0.3.2 =
 * Connection status on the settings page
