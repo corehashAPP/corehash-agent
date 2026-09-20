@@ -3,7 +3,7 @@
  * Plugin Name: Corehash Agent
  * Plugin URI:  https://corehash.app
  * Description: Connects this site to Corehash. Exposes one secured REST endpoint with an inventory of versions, plugins and file hashes.
- * Version:     0.6.0
+ * Version:     0.6.1
  * Author:      Corehash
  * Author URI:  https://corehash.app
  * License:     GPL-2.0-or-later
@@ -14,7 +14,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Corehash_Agent
 {
-    const VERSION      = '0.6.0';
+    const VERSION      = '0.6.1';
     const OPTION_TOKEN = 'corehash_token';
     const OPTION_SEEN  = 'corehash_last_contact';
     const OPTION_EVENTS = 'corehash_events';
@@ -22,6 +22,7 @@ final class Corehash_Agent
     const MAX_EVENTS    = 300;
     const OPTION_QUEUE  = 'corehash_queue';
     const OPTION_HOT    = 'corehash_hot';
+    const OPTION_LOGINS = 'corehash_logins';
     const PUSH_URL      = 'https://corehash.app/agent/event';
     const HOT_INTERVAL  = 300; // seconden tussen twee hot scans
     const ROOT_FILES    = ['index.php', 'wp-config.php', '.htaccess', 'wp-login.php'];
@@ -67,6 +68,10 @@ final class Corehash_Agent
 
         if (!wp_next_scheduled('corehash_hot_scan')) {
             wp_schedule_event(time() + 60, 'corehash_5min', 'corehash_hot_scan');
+        }
+
+        if (!get_option('corehash_tracking_since')) {
+            update_option('corehash_tracking_since', time(), false);
         }
 
         // self-hosted updates + "View details"
@@ -190,6 +195,10 @@ final class Corehash_Agent
 
         if (!wp_next_scheduled('corehash_hot_scan')) {
             wp_schedule_event(time() + 60, 'corehash_5min', 'corehash_hot_scan');
+        }
+
+        if (!get_option('corehash_tracking_since')) {
+            update_option('corehash_tracking_since', time(), false);
         }
     }
 
@@ -322,6 +331,9 @@ final class Corehash_Agent
                 'debug'      => defined('WP_DEBUG') && WP_DEBUG,
                 'file_edit'  => !(defined('DISALLOW_FILE_EDIT') && DISALLOW_FILE_EDIT),
                 'auto_update_core' => (bool) get_site_option('auto_update_core_major', false),
+                'users_can_register' => (bool) get_option('users_can_register'),
+                'default_role'       => (string) get_option('default_role'),
+                'comments_open'      => (string) get_option('default_comment_status') === 'open',
             ],
             'versions'     => [
                 'wordpress' => $wp_version,
@@ -432,14 +444,26 @@ final class Corehash_Agent
     private static function users(): array
     {
         $counts = count_users();
+        $logins = (array) get_option(self::OPTION_LOGINS, []);
+        $admins = [];
+
+        foreach (get_users(['role' => 'administrator', 'number' => 100]) as $u) {
+            $admins[] = [
+                'login'      => $u->user_login,
+                'name'       => $u->display_name,
+                'email'      => $u->user_email,
+                'registered' => $u->user_registered,
+                'last_login' => $logins[(string) $u->ID] ?? null,
+                'posts'      => (int) count_user_posts($u->ID),
+            ];
+        }
 
         return [
             'total'  => $counts['total_users'],
             'admins' => $counts['avail_roles']['administrator'] ?? 0,
-            'admin_logins' => array_map(
-                fn($u) => $u->user_login,
-                get_users(['role' => 'administrator', 'fields' => ['user_login']])
-            ),
+            'admin_logins' => array_column($admins, 'login'),
+            'admin_detail' => $admins,
+            'tracking_since' => (int) get_option('corehash_tracking_since', 0),
         ];
     }
 
@@ -948,6 +972,14 @@ final class Corehash_Agent
     public static function ev_login($login, $user): void
     {
         self::event('login', ['user' => $login, 'admin' => in_array('administrator', (array) $user->roles, true)]);
+
+        // laatste login per gebruiker, zodat Corehash slapende beheerders ziet
+        $logins = (array) get_option(self::OPTION_LOGINS, []);
+        $logins[(string) $user->ID] = time();
+
+        if (count($logins) > 200) $logins = array_slice($logins, -200, null, true);
+
+        update_option(self::OPTION_LOGINS, $logins, false);
     }
 
     public static function ev_profile_update($id, $old): void
