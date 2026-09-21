@@ -3,7 +3,7 @@
  * Plugin Name: Corehash Agent
  * Plugin URI:  https://corehash.app
  * Description: Connects this site to Corehash. Exposes one secured REST endpoint with an inventory of versions, plugins and file hashes.
- * Version:     0.7.4
+ * Version:     0.7.5
  * Author:      Corehash
  * Author URI:  https://corehash.app
  * License:     GPL-2.0-or-later
@@ -14,7 +14,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Corehash_Agent
 {
-    const VERSION      = '0.7.4';
+    const VERSION      = '0.7.5';
     const OPTION_TOKEN = 'corehash_token';
     const OPTION_SEEN  = 'corehash_last_contact';
     const OPTION_EVENTS = 'corehash_events';
@@ -1264,7 +1264,10 @@ final class Corehash_Agent
         if (!is_dir($dir) && !wp_mkdir_p($dir)) return false;
         if (!wp_is_writable($dir)) return false;
 
-        $source = __DIR__ . '/hardening.php';
+        // Bewust een map dieper: WordPress scant alleen het eerste niveau
+        // van een pluginmap op plugin-headers, dus zo verschijnt dit bestand
+        // niet als losse plugin in de lijst.
+        $source = __DIR__ . '/lib/hardening.php';
 
         if (!is_readable($source)) return false;
 
