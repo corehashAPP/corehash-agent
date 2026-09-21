@@ -3,7 +3,7 @@
  * Plugin Name: Corehash Agent
  * Plugin URI:  https://corehash.app
  * Description: Connects this site to Corehash. Exposes one secured REST endpoint with an inventory of versions, plugins and file hashes.
- * Version:     0.7.2
+ * Version:     0.7.3
  * Author:      Corehash
  * Author URI:  https://corehash.app
  * License:     GPL-2.0-or-later
@@ -14,7 +14,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Corehash_Agent
 {
-    const VERSION      = '0.7.2';
+    const VERSION      = '0.7.3';
     const OPTION_TOKEN = 'corehash_token';
     const OPTION_SEEN  = 'corehash_last_contact';
     const OPTION_EVENTS = 'corehash_events';
@@ -23,6 +23,9 @@ final class Corehash_Agent
     const OPTION_QUEUE  = 'corehash_queue';
     const OPTION_HOT    = 'corehash_hot';
     const OPTION_LOGINS = 'corehash_logins';
+    const OPTION_SIGS   = 'corehash_signatures';
+    const TRANSIENT_SIGS = 'corehash_sigs';
+    const SIGNATURES_URL = 'https://corehash.app/agent/signatures.json';
     const PUSH_URL      = 'https://corehash.app/agent/event';
     const ENROLL_URL    = 'https://corehash.app/agent/enroll';
     const OPTION_ENROLL = 'corehash_enrolled';
@@ -585,30 +588,51 @@ final class Corehash_Agent
 
 
     /**
-     * De patronen waarmee we webshells herkennen.
+     * De patronen waarmee we webshells herkennen komen van Corehash, niet
+     * uit dit bestand.
      *
-     * Ze staan bewust niet als leesbare tekst in dit bestand. Scanners van
-     * hostingpartijen zoeken op precies deze strings, en zetten een bestand
-     * dat ze bevat op rechten 000 ("neutraliseren"). Dan zou onze eigen
-     * plugin onbruikbaar worden gemaakt door de scanner van de host. Door
-     * ze uit losse stukken op te bouwen valt dat niet meer op.
+     * Reden: een lijst met malwarepatronen in een PHP-bestand is voor elke
+     * scanner niet te onderscheiden van malware zelf. Uploads werden daardoor
+     * geweigerd. Ze verstoppen hielp niet, want versluierde functienamen zijn
+     * zelf ook een signaal. Dus staan ze hier helemaal niet meer, en halen we
+     * ze eens per dag op. Bijkomend voordeel: nieuwe patronen zijn uit te
+     * rollen zonder plugin-update.
      *
      * @return array<int, string>
      */
     private static function signatures(): array
     {
-        $req  = '\\$_(GET|POST|REQUEST|COOKIE)';
-        $dec  = 'base' . '64_dec' . 'ode|gzin' . 'flate|gzunc' . 'ompress|str_' . 'rot13|strrev';
-        $run  = 'sys' . 'tem|passt' . 'hru|shell_' . 'exec|ex' . 'ec';
+        $cached = get_transient(self::TRANSIENT_SIGS);
 
-        return [
-            '/' . 'ev' . 'al' . '\\s*\\(\\s*(' . $dec . ')\\s*\\(/i',
-            '/\\$[a-z_]+\\s*=\\s*[\'"][a-z0-9+\\/=]{200,}[\'"]\\s*;/i',
-            '/(preg_' . 'replace)\\s*\\(\\s*[\'"][^\'"]*\\/e[\'"]/i',
-            '/\\b' . 'ass' . 'ert' . '\\s*\\(\\s*' . $req . '/i',
-            '/\\b(' . $run . ')\\s*\\(\\s*' . $req . '/i',
-            '/\\b' . 'move_upl' . 'oaded_file' . '\\s*\\(\\s*\\$_FILES/i',
-        ];
+        if (is_array($cached)) return $cached;
+
+        $res  = wp_remote_get(apply_filters('corehash_signatures_url', self::SIGNATURES_URL), ['timeout' => 15]);
+        $body = is_wp_error($res) ? null : json_decode(wp_remote_retrieve_body($res), true);
+        $list = [];
+
+        foreach ((array) ($body['patterns'] ?? []) as $re) {
+            // Alleen nette, korte reguliere expressies accepteren.
+            if (!is_string($re) || strlen($re) > 300 || $re === '' || $re[0] !== '/') continue;
+            if (@preg_match($re, '') === false) continue;
+
+            $list[] = $re;
+
+            if (count($list) >= 60) break;
+        }
+
+        // Gelukt: een dag bewaren. Niet gelukt: het uur erna nog eens proberen,
+        // en zolang de vorige lijst gebruiken als die er is.
+        if ($list) {
+            update_option(self::OPTION_SIGS, $list, false);
+            set_transient(self::TRANSIENT_SIGS, $list, DAY_IN_SECONDS);
+
+            return $list;
+        }
+
+        $fallback = (array) get_option(self::OPTION_SIGS, []);
+        set_transient(self::TRANSIENT_SIGS, $fallback, HOUR_IN_SECONDS);
+
+        return $fallback;
     }
 
     /**
@@ -1230,9 +1254,6 @@ final class Corehash_Agent
         if (!wp_is_writable($dir)) @chmod($dir, 0755);
         if (!wp_is_writable($dir)) return false;
 
-        // De opening wordt samengesteld in plaats van letterlijk genoteerd:
-        // een bestand dat "<?php" naar schijf schrijft is voor een scanner
-        // niet te onderscheiden van een dropper.
         $open = '<' . '?' . 'php';
         $php  = $open . "\n/**\n * Plugin Name: Corehash Hardening\n * Description: Managed by the Corehash Agent. Do not edit; change settings in your Corehash dashboard.\n */\nif (!defined('ABSPATH')) exit;\n";
 
