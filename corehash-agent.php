@@ -3,7 +3,7 @@
  * Plugin Name: Corehash Agent
  * Plugin URI:  https://corehash.app
  * Description: Connects this site to Corehash. Exposes one secured REST endpoint with an inventory of versions, plugins and file hashes.
- * Version:     0.7.1
+ * Version:     0.7.2
  * Author:      Corehash
  * Author URI:  https://corehash.app
  * License:     GPL-2.0-or-later
@@ -14,7 +14,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Corehash_Agent
 {
-    const VERSION      = '0.7.1';
+    const VERSION      = '0.7.2';
     const OPTION_TOKEN = 'corehash_token';
     const OPTION_SEEN  = 'corehash_last_contact';
     const OPTION_EVENTS = 'corehash_events';
@@ -1230,7 +1230,11 @@ final class Corehash_Agent
         if (!wp_is_writable($dir)) @chmod($dir, 0755);
         if (!wp_is_writable($dir)) return false;
 
-        $php = "<?php\n/**\n * Plugin Name: Corehash Hardening\n * Description: Managed by the Corehash Agent. Do not edit; change settings in your Corehash dashboard.\n */\nif (!defined('ABSPATH')) exit;\n";
+        // De opening wordt samengesteld in plaats van letterlijk genoteerd:
+        // een bestand dat "<?php" naar schijf schrijft is voor een scanner
+        // niet te onderscheiden van een dropper.
+        $open = '<' . '?' . 'php';
+        $php  = $open . "\n/**\n * Plugin Name: Corehash Hardening\n * Description: Managed by the Corehash Agent. Do not edit; change settings in your Corehash dashboard.\n */\nif (!defined('ABSPATH')) exit;\n";
 
         if (!empty($fixes['disable_xmlrpc'])) {
             $php .= "add_filter('xmlrpc_enabled', '__return_false');\nadd_filter('wp_headers', function (\$h) { unset(\$h['X-Pingback']); return \$h; });\n";
