@@ -4,7 +4,7 @@ Tags: security, monitoring, malware, vulnerability, integrity
 Requires at least: 6.0
 Tested up to: 7.1
 Requires PHP: 8.0
-Stable tag: 0.7.3
+Stable tag: 0.7.4
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -35,6 +35,9 @@ No. The inventory is only built when Corehash asks for it, roughly once an hour,
 Version numbers, plugin and theme names, file hashes and admin usernames. Never file contents, never database content.
 
 == Changelog ==
+
+= 0.7.4 =
+* Hardening now ships as a normal file that is copied into place, instead of PHP code assembled at runtime. Scanners flagged the old approach as a dropper, and they were right to
 
 = 0.7.3 =
 * Malware patterns are no longer stored in the plugin file. They are fetched from Corehash once a day, so scanners and firewalls stop refusing the upload

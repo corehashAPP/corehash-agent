@@ -3,7 +3,7 @@
  * Plugin Name: Corehash Agent
  * Plugin URI:  https://corehash.app
  * Description: Connects this site to Corehash. Exposes one secured REST endpoint with an inventory of versions, plugins and file hashes.
- * Version:     0.7.3
+ * Version:     0.7.4
  * Author:      Corehash
  * Author URI:  https://corehash.app
  * License:     GPL-2.0-or-later
@@ -14,7 +14,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Corehash_Agent
 {
-    const VERSION      = '0.7.3';
+    const VERSION      = '0.7.4';
     const OPTION_TOKEN = 'corehash_token';
     const OPTION_SEEN  = 'corehash_last_contact';
     const OPTION_EVENTS = 'corehash_events';
@@ -1241,36 +1241,34 @@ final class Corehash_Agent
         }
     }
 
+    /**
+     * Zet de hardening aan of uit.
+     *
+     * Het bestand wordt gekopieerd, niet gegenereerd. Code die PHP in
+     * elkaar zet en wegschrijft is voor elke scanner een dropper, en daar
+     * heeft die scanner gelijk in. Welke maatregelen aan staan zit in de
+     * optie corehash_fixes, die hardening.php zelf uitleest.
+     */
     private static function write_mu_plugin(array $fixes): bool
     {
         $dir  = WPMU_PLUGIN_DIR;
         $file = $dir . '/corehash-hardening.php';
 
-        if (empty($fixes)) {
-            return !file_exists($file) || @unlink($file);
+        // Niets meer aan? Dan hoort het bestand er ook niet meer te zijn.
+        if (!$fixes) {
+            if (file_exists($file)) @unlink($file);
+
+            return true;
         }
 
-        if (!is_dir($dir) && !@mkdir($dir, 0755, true)) return false;
-        if (!wp_is_writable($dir)) @chmod($dir, 0755);
+        if (!is_dir($dir) && !wp_mkdir_p($dir)) return false;
         if (!wp_is_writable($dir)) return false;
 
-        $open = '<' . '?' . 'php';
-        $php  = $open . "\n/**\n * Plugin Name: Corehash Hardening\n * Description: Managed by the Corehash Agent. Do not edit; change settings in your Corehash dashboard.\n */\nif (!defined('ABSPATH')) exit;\n";
+        $source = __DIR__ . '/hardening.php';
 
-        if (!empty($fixes['disable_xmlrpc'])) {
-            $php .= "add_filter('xmlrpc_enabled', '__return_false');\nadd_filter('wp_headers', function (\$h) { unset(\$h['X-Pingback']); return \$h; });\n";
-        }
-        if (!empty($fixes['hide_rest_users'])) {
-            $php .= "add_filter('rest_endpoints', function (\$e) { if (!is_user_logged_in()) { foreach (array_keys(\$e) as \$k) { if (str_starts_with(\$k, '/wp/v2/users')) unset(\$e[\$k]); } } return \$e; });\nadd_filter('rest_pre_dispatch', function (\$r, \$s, \$req) { if (!is_user_logged_in() && str_starts_with(\$req->get_route(), '/wp/v2/users')) { return new WP_Error('rest_no_route', 'No route was found matching the URL and request method.', ['status' => 404]); } return \$r; }, 10, 3);\nadd_action('init', function () { if (!is_admin() && isset(\$_GET['author']) && !is_user_logged_in()) { wp_redirect(home_url(), 301); exit; } });\nadd_filter('oembed_response_data', function (\$d) { unset(\$d['author_name'], \$d['author_url']); return \$d; });\n";
-        }
-        if (!empty($fixes['disallow_file_edit'])) {
-            $php .= "if (!defined('DISALLOW_FILE_EDIT')) define('DISALLOW_FILE_EDIT', true);\n";
-        }
-        if (!empty($fixes['security_headers'])) {
-            $php .= "add_action('send_headers', function () { if (is_ssl()) header('Strict-Transport-Security: max-age=31536000'); header('X-Content-Type-Options: nosniff'); header('X-Frame-Options: SAMEORIGIN'); header('Referrer-Policy: strict-origin-when-cross-origin'); });\n";
-        }
+        if (!is_readable($source)) return false;
 
-        return (bool) @file_put_contents($file, $php);
+        return (bool) @copy($source, $file);
     }
 
     /* ---------- helpers ---------- */
