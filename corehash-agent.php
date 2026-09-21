@@ -3,7 +3,7 @@
  * Plugin Name: Corehash Agent
  * Plugin URI:  https://corehash.app
  * Description: Connects this site to Corehash. Exposes one secured REST endpoint with an inventory of versions, plugins and file hashes.
- * Version:     0.7.5
+ * Version:     0.7.6
  * Author:      Corehash
  * Author URI:  https://corehash.app
  * License:     GPL-2.0-or-later
@@ -14,7 +14,7 @@ if (!defined('ABSPATH')) exit;
 
 final class Corehash_Agent
 {
-    const VERSION      = '0.7.5';
+    const VERSION      = '0.7.6';
     const OPTION_TOKEN = 'corehash_token';
     const OPTION_SEEN  = 'corehash_last_contact';
     const OPTION_EVENTS = 'corehash_events';
@@ -35,7 +35,10 @@ final class Corehash_Agent
     const CACHE_TTL    = 50 * MINUTE_IN_SECONDS;
     const NAMESPACE    = 'corehash/v1';
     const UPDATE_URL   = 'https://corehash.app/agent/update.json';
-    const ALLOWED_IPS  = ['35.214.231.225']; // Corehash-server. Uitbreiden met een filter: corehash_allowed_ips
+    // Noodlijst voor het geval we de echte lijst nog niet hebben opgehaald.
+    // De actuele adressen komen van corehash.app; aanpassen kan ook met het
+    // filter corehash_allowed_ips.
+    const ALLOWED_IPS  = ['35.214.231.225', '35.214.149.223'];
 
     public static function init(): void
     {
@@ -213,6 +216,10 @@ final class Corehash_Agent
         if (!get_option('corehash_tracking_since')) {
             update_option('corehash_tracking_since', time(), false);
         }
+
+        // Instellingen alvast ophalen: anders kan Corehash ons niet bereiken
+        // zolang wij niet weten vanaf welk adres dat gebeurt.
+        self::remote_config();
     }
 
     public static function deactivate(): void
@@ -288,7 +295,7 @@ final class Corehash_Agent
         ]);
     }
 
-    public static function auth(WP_REST_Request $request): bool
+    public static function auth(WP_REST_Request $request)
     {
         // nooit door host-caches (SiteGround, Kinsta, LiteSpeed, Varnish) laten cachen
         if (!defined('DONOTCACHEPAGE')) define('DONOTCACHEPAGE', true);
@@ -298,7 +305,11 @@ final class Corehash_Agent
         header('X-LiteSpeed-Cache-Control: no-cache');
         header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
 
-        if (!self::ip_allowed()) return false;
+        if (!self::ip_allowed()) {
+            // Eigen foutcode, zodat in het dashboard te zien is dat het aan
+            // het adres ligt en niet aan het token.
+            return new WP_Error('corehash_ip', 'This address is not allowed to reach the Corehash agent.', ['status' => 403]);
+        }
 
         $given  = (string) $request->get_header('x-corehash-token');
         $stored = (string) get_option(self::OPTION_TOKEN);
@@ -314,15 +325,13 @@ final class Corehash_Agent
 
     private static function ip_allowed(): bool
     {
-        $allowed = apply_filters('corehash_allowed_ips', self::ALLOWED_IPS);
+        $known   = (array) (get_option(self::OPTION_SIGS, [])['ips'] ?? []);
+        $allowed = apply_filters('corehash_allowed_ips', $known ?: self::ALLOWED_IPS);
 
-        if (empty($allowed)) return true; // allowlist uitgeschakeld
+        // Lege lijst betekent: geen IP-controle. Het token blijft verplicht.
+        if (empty($allowed)) return true;
 
-        $ip = $_SERVER['REMOTE_ADDR'] ?? '';
-
-        // achter Cloudflare / proxy: eerste IP uit X-Forwarded-For alleen vertrouwen als
-        // de directe verbinding zelf van een bekende proxy komt; anders REMOTE_ADDR.
-        return in_array($ip, $allowed, true);
+        return in_array($_SERVER['REMOTE_ADDR'] ?? '', $allowed, true);
     }
 
     public static function inventory(WP_REST_Request $request): WP_REST_Response
@@ -602,31 +611,53 @@ final class Corehash_Agent
      */
     private static function signatures(): array
     {
+        return (array) (self::remote_config()['patterns'] ?? []);
+    }
+
+    /**
+     * Haalt de instellingen op bij Corehash: de patronen waarmee we
+     * webshells herkennen en de adressen waarvandaan Corehash contact
+     * opneemt. Beide staan bewust niet in dit bestand: patronen omdat
+     * scanners ze niet van echte malware kunnen onderscheiden, adressen
+     * omdat hosting ze wijzigt en je een plugin op honderden sites niet
+     * daarvoor wilt bijwerken.
+     */
+    private static function remote_config(): array
+    {
         $cached = get_transient(self::TRANSIENT_SIGS);
 
         if (is_array($cached)) return $cached;
 
         $res  = wp_remote_get(apply_filters('corehash_signatures_url', self::SIGNATURES_URL), ['timeout' => 15]);
         $body = is_wp_error($res) ? null : json_decode(wp_remote_retrieve_body($res), true);
-        $list = [];
+
+        $patterns = [];
+        $ips      = [];
 
         foreach ((array) ($body['patterns'] ?? []) as $re) {
-            // Alleen nette, korte reguliere expressies accepteren.
-            if (!is_string($re) || strlen($re) > 300 || $re === '' || $re[0] !== '/') continue;
+            if (!is_string($re) || $re === '' || $re[0] !== '/' || strlen($re) > 300) continue;
             if (@preg_match($re, '') === false) continue;
 
-            $list[] = $re;
+            $patterns[] = $re;
 
-            if (count($list) >= 60) break;
+            if (count($patterns) >= 60) break;
         }
 
-        // Gelukt: een dag bewaren. Niet gelukt: het uur erna nog eens proberen,
-        // en zolang de vorige lijst gebruiken als die er is.
-        if ($list) {
-            update_option(self::OPTION_SIGS, $list, false);
-            set_transient(self::TRANSIENT_SIGS, $list, DAY_IN_SECONDS);
+        foreach ((array) ($body['ips'] ?? []) as $ip) {
+            if (is_string($ip) && filter_var($ip, FILTER_VALIDATE_IP)) $ips[] = $ip;
 
-            return $list;
+            if (count($ips) >= 20) break;
+        }
+
+        $config = ['patterns' => $patterns, 'ips' => $ips];
+
+        // Gelukt: een dag bewaren. Niet gelukt: het uur erna nog eens
+        // proberen en zolang teruggrijpen op wat we eerder hadden.
+        if ($patterns || $ips) {
+            update_option(self::OPTION_SIGS, $config, false);
+            set_transient(self::TRANSIENT_SIGS, $config, DAY_IN_SECONDS);
+
+            return $config;
         }
 
         $fallback = (array) get_option(self::OPTION_SIGS, []);
@@ -882,6 +913,7 @@ final class Corehash_Agent
 
         update_option(self::OPTION_HOT, $now, false);
 
+        self::remote_config();
         self::flush_queue();
     }
 
